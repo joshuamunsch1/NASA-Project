@@ -6,11 +6,12 @@ from sklearn.svm import LinearSVC
 from sklearn.linear_model import LogisticRegression
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.inspection import permutation_importance
 from typing import List, Optional, Dict, Any
+
 
 MODEL_PARAMS = {
     "rf": {
@@ -26,225 +27,262 @@ MODEL_PARAMS = {
         "C": 1.0,
         "loss": "squared_hinge",
         "penalty": "l2",
+        "max_iter": 5000,
         "random_state": 12345,
     },
     "lda": {
         "solver": "eigen",
-        "shrinkage": "auto"
+        "shrinkage": "auto",
     },
     "glm": {
         "C": 1.0,
         "solver": "lbfgs",
+        "max_iter": 1000,
         "class_weight": "balanced",
-        "random_state": 0
-    }
+        "random_state": 0,
+    },
 }
 
 
+
 class MLTrainer:
-    def __init__(self, ml_concat_csv: str, genes_txt: Optional[str] = None):
-        self.ml_concat_csv = ml_concat_csv
-        self.genes_txt = genes_txt
-        self.concat_df = pd.read_csv(self.ml_concat_csv, index_col=0)
-        self.label_col_name = self.concat_df.columns[-1]
-        self.feature_names = list(self.concat_df.columns[:-1])
-        self.X = self.concat_df.iloc[:, :-1]
-        self.y = self.concat_df.iloc[:, -1].astype(int)
-        self.Genes = {}
-        if self.genes_txt is not None and os.path.exists(self.genes_txt):
-            with open(self.genes_txt, 'r') as fh:
-                genes = [line.strip() for line in fh if line.strip()]
-            self.Genes['Gene'] = [g for g in genes if g in self.feature_names]
+    def __init__(
+        self,
+        feature_csv: str,
+        metadata_csv: str,
+        label_col: str = "group",
+        sample_id_col: Optional[str] = None,
+        genes_txt: Optional[str] = None,
+    ):
         self.random_state = 12345
+
+        feature_df = pd.read_csv(feature_csv, index_col=0)
+        feature_df.index   = feature_df.index.astype(str)
+        feature_df.columns = feature_df.columns.astype(str)
+
+        meta_df = pd.read_csv(metadata_csv)
+        id_col = sample_id_col if sample_id_col is not None else meta_df.columns[0]
+        meta_df = meta_df.set_index(id_col)
+        meta_df.index = meta_df.index.astype(str)
+
+        if label_col not in meta_df.columns:
+            raise ValueError
+
+        overlap_rows = len(set(feature_df.index)   & set(meta_df.index))
+        overlap_cols = len(set(feature_df.columns) & set(meta_df.index))
+
+        if overlap_rows == 0 and overlap_cols == 0:
+            raise ValueError
+
+        if overlap_cols > overlap_rows:
+            feature_df = feature_df.T   
+
+        combined = feature_df.join(meta_df[[label_col]], how="inner")
+
+        if combined.shape[0] == 0:
+            raise ValueError
+
+        print(f"Loaded {combined.shape[0]} with {combined.shape[1] - 1}")
+        print(f"Label distribution:\n{combined[label_col].value_counts()}\n")
+
+        self.label_encoder = LabelEncoder()
+        combined["_label_enc"] = self.label_encoder.fit_transform(combined[label_col].astype(str))
+
+        self.feature_names = [c for c in combined.columns if c not in [label_col, "_label_enc"]]
+        self.X = combined[self.feature_names]
+        self.y = combined["_label_enc"].astype(int)
+
+       
+        self.concat_df = combined.rename(columns={label_col: "target_label", "_label_enc": "target_label_encoded"})
+
+        self.Genes: Dict[str, List[str]] = {}
+        if genes_txt is not None and os.path.exists(genes_txt):
+            with open(genes_txt) as fh:
+                genes = [line.strip() for line in fh if line.strip()]
+            self.Genes["Gene"] = [g for g in genes if g in self.feature_names]
+            print(f"Gene list loaded: {len(self.Genes['Gene'])} genes overlap with features.")
+
 
     def _build_model(self, name: str):
         if name == "rf":
-            model = RandomForestClassifier(**MODEL_PARAMS["rf"])
+            return RandomForestClassifier(**MODEL_PARAMS["rf"])
         elif name == "svm":
-            svm_params = MODEL_PARAMS["svm"].copy()
-            model = make_pipeline(StandardScaler(), LinearSVC(**svm_params))
+            return make_pipeline(StandardScaler(), LinearSVC(**MODEL_PARAMS["svm"]))
         elif name == "lda":
-            model = make_pipeline(StandardScaler(), LinearDiscriminantAnalysis(**MODEL_PARAMS["lda"]))
+            return make_pipeline(StandardScaler(), LinearDiscriminantAnalysis(**MODEL_PARAMS["lda"]))
         elif name == "glm":
-            glm_params = MODEL_PARAMS["glm"].copy()
-            model = make_pipeline(StandardScaler(), LogisticRegression(**glm_params))
+            return make_pipeline(StandardScaler(), LogisticRegression(**MODEL_PARAMS["glm"]))
         else:
-            raise ValueError(f"Unknown model name: {name}")
-        return model
+            raise ValueError
 
-    def train(self,
-              models: List[str],
-              roc: bool = False,
-              test_set: Optional[List[str]] = None,
-              accuracy_block: bool = False,
-              n_splits: int = 5,
-              verbose: bool = False) -> Dict[str, Dict[str, Any]]:
+    # ---------------------------
+    def train(
+        self,
+        models: List[str],
+        mrmr: bool = False,
+        roc: bool = False,
+        pfi: bool = False,
+        test_set: Optional[List[str]] = None,
+        n_splits: int = 5,
+        verbose: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
 
+        X = self.X.copy()
         y = self.y.copy()
-        X = self.X
 
-        if test_set:
-            test_mask = X.index.isin(test_set)
-            if test_mask.sum() == 0:
+        if test_set is not None:
+            test_mask  = X.index.isin(test_set)
+            train_idx  = np.where(~test_mask)[0]
+            test_idx   = np.where(test_mask)[0]
+            if len(test_idx) == 0:
                 raise ValueError
-            train_idx = np.where(~test_mask)[0]
-            test_idx = np.where(test_mask)[0]
         else:
-            train_idx = None
-            test_idx = None
+            train_idx = test_idx = None
 
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=self.random_state)
-
         results: Dict[str, Dict[str, Any]] = {}
-        for model_name in models:
-            results[model_name] = {
-                "accuracy": [],
-                "model_coefs": None,
-                "importance": None,
-                "roc": None,
-                "predictions": None,
-            }
 
         for model_name in models:
             if verbose:
-                print(f"\nTraining model: {model_name}")
+                print(f"\n--- Training: {model_name} ---")
 
-            estimator = self._build_model(model_name)
-
+            estimator  = self._build_model(model_name)
             acc_scores = []
-            coef_list = []
-            roc_records = []
-            pred_records = []
+            coef_list  = []
+            pfi_list   = []
+            roc_records   = []
+            pred_records  = []
 
             if test_set is not None:
-                if accuracy_block:
-                    splits = skf.split(X.iloc[train_idx, :], y.iloc[train_idx])
-                    wrapped_splits = []
-                    for tr, te in splits:
-                        wrapped_splits.append((train_idx[tr], train_idx[te]))
-                    iterator = wrapped_splits
-                else:
-                    iterator = [(train_idx, test_idx)]
+                iterator = [(train_idx, test_idx)]
             else:
-                iterator = skf.split(X, y)
+                iterator = list(skf.split(X, y))
 
+           # print(iterator)
             for split_num, (train_inds, test_inds) in enumerate(iterator):
-                X_train = X.iloc[train_inds, :].values
+              #  print(split_num)
+              #  print(train_inds)
+              #  print(test_inds)
+                X_train = X.iloc[train_inds].values
                 y_train = y.iloc[train_inds].values
-                X_test = X.iloc[test_inds, :].values
-                y_test = y.iloc[test_inds].values
+                X_test  = X.iloc[test_inds].values
+                y_test  = y.iloc[test_inds].values
 
                 estimator.fit(X_train, y_train)
-
                 y_pred = estimator.predict(X_test)
                 acc = accuracy_score(y_test, y_pred)
                 acc_scores.append(acc)
 
-                if model_name == "rf":
-                    base = estimator
-                    if hasattr(base, 'named_steps'):
-                        final = list(base.named_steps.values())[-1]
-                    else:
-                        final = base
-                    feat_imp = getattr(final, "feature_importances_", None)
-                    if feat_imp is not None:
-                        coef_list.append(feat_imp)
-                else:
-                    base = estimator
-                    if hasattr(base, 'named_steps'):
-                        steps = list(base.named_steps.items())
-                        final = steps[-1][1]
-                    else:
-                        final = base
-                    if hasattr(final, "coef_"):
-                        coefs = final.coef_
-                        if coefs.ndim == 2:
-                            avg_coef = np.mean(coefs, axis=0)
-                        else:
-                            avg_coef = coefs
-                        coef_list.append(avg_coef)
+                if verbose:
+                    print(f"  Fold {split_num + 1} accuracy: {acc:.4f}")
+                
+                final = list(estimator.named_steps.values())[-1] if hasattr(estimator, "named_steps") else estimator
+                if hasattr(final, "feature_importances_"):
+                    coef_list.append(final.feature_importances_)
+                elif hasattr(final, "coef_"):
+                    coefs = final.coef_
+                    coef_list.append(np.mean(coefs, axis=0) if coefs.ndim == 2 else coefs)
 
                 if roc:
-                    prob_scores = None
                     if hasattr(estimator, "predict_proba"):
-                        prob_scores = estimator.predict_proba(X_test)[:, 1]
+                        scores = estimator.predict_proba(X_test)[:, 1]
+                    elif hasattr(estimator, "decision_function"):
+                        scores = estimator.decision_function(X_test)
                     else:
-                        if hasattr(estimator, "decision_function"):
-                            prob_scores = estimator.decision_function(X_test)
-                        else:
-                            prob_scores = y_pred
+                        scores = y_pred
                     try:
-                        auc = roc_auc_score(y_test, prob_scores)
+                        auc = roc_auc_score(y_test, scores)
                     except Exception:
                         auc = np.nan
-                    roc_records.append({
-                        "y_true": y_test,
-                        "y_score": prob_scores,
-                        "auc": auc,
-                        "split": split_num
-                    })
-                    sample_names = X.index[test_inds]
-                    pred_df = pd.DataFrame({
-                        "sample": sample_names,
-                        "truth": y_test,
-                        "score": prob_scores
-                    })
-                    pred_records.append(pred_df)
+                    roc_records.append(auc)
+                    pred_records.append(pd.DataFrame({
+                        "sample": X.index[test_inds],
+                        "truth":  y_test,
+                        "score":  scores,
+                    }))
 
-            results_model = results[model_name]
-            results_model["accuracy"] = pd.DataFrame({"Accuracy": acc_scores})
+                if pfi:
+                    try:
+                        imp = permutation_importance(
+                            estimator, X_test, y_test,
+                            n_repeats=1, random_state=self.random_state,
+                            n_jobs=-1, scoring="accuracy",
+                        )
+                        pfi_list.append(imp.importances_mean)
+                        print(imp)
+                        print(imp.importances_mean)
+                        print(pfi_list)
+                    except Exception as e:
+                        if verbose:
+                            print(f"  Permutation importance failed: {e}")
 
+            accuracy_df = pd.DataFrame({"Accuracy": acc_scores})
+
+            coef_df = None
             if coef_list:
-                coef_arr = np.vstack(coef_list)
-                coef_mean = coef_arr.mean(axis=0)
+                coef_mean = np.vstack(coef_list).mean(axis=0)
                 coef_df = pd.DataFrame(coef_mean, index=X.columns, columns=["Score"])
-                results_model["model_coefs"] = coef_df
-            else:
-                results_model["model_coefs"] = None
 
-            if roc:
-                aucs = [r["auc"] for r in roc_records]
-                results_model["roc"] = {"per_split_auc": aucs, "mean_auc": np.nanmean(aucs) if len(aucs) else np.nan}
-                if pred_records:
-                    results_model["predictions"] = pd.concat(pred_records, axis=0, ignore_index=True)
-                else:
-                    results_model["predictions"] = None
-            else:
-                results_model["roc"] = None
-                results_model["predictions"] = None
+            pfi_df = None
+            if pfi_list:
+                pfi_arr = np.vstack(pfi_list)
+                pfi_df  = pd.DataFrame({
+                    "pfi_mean": pfi_arr.mean(axis=0),
+                    "pfi_std":  pfi_arr.std(axis=0),
+                }, index=X.columns)
+
+            roc_summary  = {"per_split_auc": roc_records, "mean_auc": np.nanmean(roc_records)} if roc else None
+            predictions  = pd.concat(pred_records, ignore_index=True) if pred_records else None
+
+            results[model_name] = {
+                "accuracy":    accuracy_df,
+                "model_coefs": coef_df,
+                "importance":  pfi_df,
+                "roc":         roc_summary,
+                "predictions": predictions,
+            }
 
             if verbose:
-                acc_mean = np.mean(results_model["accuracy"]["Accuracy"].values) if not results_model["accuracy"].empty else None
-                print(f"Model {model_name} mean accuracy: {acc_mean:.4f}" if acc_mean is not None else f"Model {model_name} no accuracies recorded")
-                if results_model["model_coefs" ] is not None:
-                    top = results_model["model_coefs"].abs().sort_values("Score", ascending=False).head(10)
-                    print("Top features (by absolute coefficient):")
-                    print(top)
+                mean_acc = accuracy_df["Accuracy"].mean()
+                print(f"  Mean accuracy: {mean_acc:.4f}")
+                if roc_summary:
+                    print(f"  Mean AUC:      {roc_summary['mean_auc']:.4f}")
+                if coef_df is not None:
+                    print("  Top 10 features:")
+                    print(coef_df.abs().sort_values("Score", ascending=False).head(10))
 
         return results
 
 
+# ---------------------------
+# Main
+# ---------------------------
 if __name__ == "__main__":
-    ML_CONCAT_F = "dataset_C_ml_concat.csv"
-    GENES_F = "dataset_C_genes.txt"
+    FEATURE_CSV   = "dataset_C_corrected_logCPM.csv"
+    METADATA_CSV  = "metadata.csv"
+    LABEL_COL     = "group"   
+    SAMPLE_ID_COL = "sample"      
+    GENES_F       = None     
+    trainer = MLTrainer(
+        feature_csv   = FEATURE_CSV,
+        metadata_csv  = METADATA_CSV,
+        label_col     = LABEL_COL,
+        sample_id_col = SAMPLE_ID_COL,
+        genes_txt     = GENES_F,
+    )
 
-    trainer = MLTrainer(ml_concat_csv=ML_CONCAT_F, genes_txt=GENES_F)
+    results = trainer.train(
+        models   = ["rf"],
+        roc      = True,
+        pfi      = False,
+        n_splits = 5,
+        verbose  = True,
+    )
 
-    rng = np.random.RandomState(0)
-    all_samples = list(trainer.concat_df.index)
-    n_holdout = max(1, int(0.2 * len(all_samples)))
-    holdout_samples = rng.choice(all_samples, size=n_holdout, replace=False).tolist()
-
-    models_to_run = ["lda"]
-    results = trainer.train(models=models_to_run,
-                            roc=True,
-                            test_set=holdout_samples,
-                            accuracy_block=False,
-                            n_splits=5,
-                            verbose=True)
-
+    # Save outputs
     out_dir = "training_results"
     os.makedirs(out_dir, exist_ok=True)
+
     for mname, rd in results.items():
         if rd["accuracy"] is not None:
             rd["accuracy"].to_csv(os.path.join(out_dir, f"{mname}_accuracy_per_fold.csv"), index=False)
@@ -254,7 +292,6 @@ if __name__ == "__main__":
             rd["importance"].to_csv(os.path.join(out_dir, f"{mname}_permutation_importance.csv"))
         if rd["predictions"] is not None:
             rd["predictions"].to_csv(os.path.join(out_dir, f"{mname}_predictions.csv"), index=False)
-        if rd["roc"] is not None:
-            pd.DataFrame([rd["roc"]]).to_csv(os.path.join(out_dir, f"{mname}_roc_summary.csv"), index=False)
 
-    print(f"Training finished. Results saved in: {out_dir}")
+
+    print(f"\nDone. Results saved to: {out_dir}/")

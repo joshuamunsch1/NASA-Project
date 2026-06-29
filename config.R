@@ -1,0 +1,6 @@
+# config.R — shared constants. Source where needed: source(here::here("config.R"))
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+ROOT       <- here::here()
+LIVER_ROOT <- file.path(ROOT, "liver")
+HEART_ROOT <- file.path(ROOT, "heart")
+SEED       <- 1L            # global RNG seed (permutation / subsampling / LOSO)
